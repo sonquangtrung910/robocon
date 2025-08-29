@@ -1,217 +1,270 @@
--
-#include <Servo.h> // Thư viện bắt buộc để điều khiển servo
-// --- KHAI BÁO ĐỐI TƯỢNG SERVO ---
-Servo servoKep; // Servo 1 điều khiển kẹp/mở, nối chân D7
-Servo servoXoay; // Servo 2 điều khiển xoay tay gắp, nối chân D4
+// Line follower tối ưu: weighted sensors + PID + lost-line search
+// Giữ mapping chân theo manual / code trước
+// IN1=11, IN2=6, IN3=5, IN4=3
+// IR: s1=8, s2=10, s3=2, s4=12, s5=13
+// SR04: TRIG=A0, ECHO=A1
+// Servo: grip D7, rot D4
 
-// --- KHAI BÁO CÁC CHÂN KẾT NỐI (THEO ĐÚNG TÀI LIỆU) ---
+#include <Servo.h>
 
-// 1. Cảm biến dò line (5 mắt)
-#define IR1_PIN 8  // Mắt trái ngoài cùng
-#define IR2_PIN 10 // Mắt trái
-#define IR3_PIN 2  // Mắt giữa (ĐÃ ĐỔI TỪ D11 SANG D2)
-#define IR4_PIN 12 // Mắt phải
-#define IR5_PIN 13 // Mắt phải ngoài cùng
+// ---------- Pin mapping ----------
+#define IN1 11
+#define IN2 6
+#define IN3 5
+#define IN4 3
 
-// 2. Động cơ DC (qua HUSC Shield)
-#define MOTOR_L_IN1 11 // (ĐÃ ĐỔI TỪ D9 SANG D11)
-#define MOTOR_L_IN2 6
-#define MOTOR_R_IN1 5  // Tương ứng IN3 trong tài liệu
-#define MOTOR_R_IN2 3  // Tương ứng IN4 trong tài liệu
+#define S1 8
+#define S2 10
+#define S3 2
+#define S4 12
+#define S5 13
 
-// 3. Nút nhấn
-#define BUTTON_START_PIN A2 // Nút nhấn bắt đầu được nối vào chân A2
+#define TRIG A0
+#define ECHO A1
 
-// --- KHAI BÁO CÁC BIẾN TOÀN CỤC ---
-int tocDoCoSo = 150;     // Tốc độ di chuyển cơ bản (0-255)
-int tocDoRe = 180;       // Tốc độ khi rẽ, cần nhanh hơn để đáp ứng
-bool daBatDau = false;   // Biến cờ để bắt đầu robot
-int demVachNgang = 0;    // Biến đếm số lần gặp vạch ngang
+#define SERVO_GRIP_PIN 7
+#define SERVO_ROT_PIN 4
 
-// ==========================================================================
-// HÀM SETUP - CHẠY 1 LẦN KHI KHỞI ĐỘNG
-// ==========================================================================
+Servo servoGrip, servoRot;
+
+// ---------- PID parameters (tune these) ----------
+float Kp = 55.0;   // proportional
+float Ki = 0.8;    // integral
+float Kd = 12.0;   // derivative
+
+float integral = 0.0;
+float lastError = 0.0;
+unsigned long lastTime = 0;
+float integralLimit = 300.0; // anti-windup
+
+// ---------- Motion / speed ----------
+int baseSpeed = 170;    // speed when on line (0-255)
+int minSpeed = 90;      // minimal PWM to overcome friction
+int maxSpeed = 255;
+
+int searchSpeed = 150;  // speed when searching (rotate)
+
+// weights for 5 sensors (leftmost -> rightmost)
+// center = 0; left negative, right positive
+const int weights[5] = {-2, -1, 0, 1, 2};
+
+// lastKnownDirection used when lost (positive -> last seen to right)
+float lastKnownError = 0.0;
+
+// ---------- Function prototypes ----------
+void moveLeftWheel(int pwmForward, int pwmBackward);
+void moveRightWheel(int pwmForward, int pwmBackward);
+void setMotorPWM(int leftPWM, int rightPWM);
+void stopMotors();
+
+int getDistance(int trigPin, int echoPin);
+void grabSequence(); // reuse from previous code (simple version)
+
+// ---------- Setup ----------
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
-  // Cấu hình các chân động cơ là OUTPUT
-  pinMode(MOTOR_L_IN1, OUTPUT);
-  pinMode(MOTOR_L_IN2, OUTPUT);
-  pinMode(MOTOR_R_IN1, OUTPUT);
-  pinMode(MOTOR_R_IN2, OUTPUT);
+  // motor pins
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
-  // Cấu hình các chân cảm biến dò line là INPUT
-  pinMode(IR1_PIN, INPUT);
-  pinMode(IR2_PIN, INPUT);
-  pinMode(IR3_PIN, INPUT);
-  pinMode(IR4_PIN, INPUT);
-  pinMode(IR5_PIN, INPUT);
+  // sensors
+  pinMode(S1, INPUT);
+  pinMode(S2, INPUT);
+  pinMode(S3, INPUT);
+  pinMode(S4, INPUT);
+  pinMode(S5, INPUT);
 
-  // Cấu hình chân nút nhấn là INPUT.
-  // Module nút nhấn trong bộ kit thường có sẵn điện trở kéo lên,
-  // nên chỉ cần dùng INPUT là đủ.
-  pinMode(BUTTON_START_PIN, INPUT);
+  // ultrasonic
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
 
-  // Gắn đối tượng servo vào các chân tương ứng
-  servoKep.attach(7);
-  servoXoay.attach(4);
+  // servos
+  servoGrip.attach(SERVO_GRIP_PIN);
+  servoRot.attach(SERVO_ROT_PIN);
+  servoGrip.write(0);
+  servoRot.write(0);
 
-  // Thiết lập trạng thái ban đầu cho tay gắp: Mở và ở vị trí ban đầu
-  servoKep.write(0);  // 0 độ: Mở tối đa
-  servoXoay.write(0); // Quay về vị trí 0 độ
-  
-  Serial.println("Robot san sang! Nhan nut (A2) de bat dau...");
+  lastTime = millis();
 }
 
-// ==========================================================================
-// HÀM LOOP - CHẠY LẶP LẠI VÔ HẠN
-// ==========================================================================
+// ---------- Main loop (non-blocking-ish) ----------
 void loop() {
-  // Robot chỉ bắt đầu khi biến daBatDau là true
-  if (!daBatDau) {
-    // Đọc trạng thái của nút nhấn. Nhấn là LOW (0)
-    int trangThaiNutNhan = digitalRead(BUTTON_START_PIN);
-    
-    if (trangThaiNutNhan == LOW) {
-      delay(50); // Chống dội đơn giản
-      // Kiểm tra lại lần nữa để chắc chắn đây là một lần nhấn
-      if (digitalRead(BUTTON_START_PIN) == LOW) {
-        Serial.println("BAT DAU!");
-        daBatDau = true;
-        // Đi thẳng một đoạn ngắn để vào line
-        diThang(tocDoCoSo);
-        delay(300);
-      }
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0; // seconds
+  if (dt <= 0) dt = 0.001;
+
+  // 1) Check ultrasonic first (gắp khi <= 10 cm)
+  int dist = getDistance(TRIG, ECHO);
+  if (dist <= 10) {
+    stopMotors();
+    delay(50);
+    grabSequence();
+    delay(600); // tránh spam grab
+    lastTime = millis();
+    return;
+  }
+
+  // 2) Read sensors and compute weighted position
+  int r1 = digitalRead(S1);
+  int r2 = digitalRead(S2);
+  int r3 = digitalRead(S3);
+  int r4 = digitalRead(S4);
+  int r5 = digitalRead(S5);
+  // manual: 1 = white, 0 = black (line = black)
+  // we want value=1 when sensor sees the line (black), so invert:
+  int v1 = 1 - r1;
+  int v2 = 1 - r2;
+  int v3 = 1 - r3;
+  int v4 = 1 - r4;
+  int v5 = 1 - r5;
+
+  int vals[5] = {v1, v2, v3, v4, v5};
+  int sumVal = v1 + v2 + v3 + v4 + v5;
+
+  bool lost = (sumVal == 0);
+
+  float position = 0.0; // weighted average position (-2 .. +2)
+  if (!lost) {
+    int wsum = 0;
+    for (int i = 0; i < 5; ++i) {
+      wsum += weights[i] * vals[i];
     }
-    return; // Thoát khỏi hàm loop và chờ lần kiểm tra tiếp theo
+    position = (float)wsum / (float)sumVal; // e.g. -2..2
+    lastKnownError = position;
   }
 
-  // --- Chương trình chính khi robot đã bắt đầu ---
-  
-  // 1. Đọc giá trị từ 5 cảm biến dò line
-  int s1 = digitalRead(IR1_PIN);
-  int s2 = digitalRead(IR2_PIN);
-  int s3 = digitalRead(IR3_PIN);
-  int s4 = digitalRead(IR4_PIN);
-  int s5 = digitalRead(IR5_PIN);
+  // Desired position is 0 (center). Error = position - desired
+  float error = position; // desired = 0
+  // PID
+  integral += error * dt;
+  // anti-windup
+  if (integral > integralLimit) integral = integralLimit;
+  if (integral < -integralLimit) integral = -integralLimit;
+  float derivative = (error - lastError) / dt;
 
-  // In trạng thái cảm biến để debug
-  Serial.print("Cam bien: ");
-  Serial.print(s1); Serial.print(s2); Serial.print(s3); Serial.print(s4); Serial.print(s5);
-  Serial.print(" | Vach ngang: "); Serial.println(demVachNgang);
+  float correction = Kp * error + Ki * integral + Kd * derivative;
 
-  // 2. Logic xử lý các trường hợp dò line
-  
-  // Gặp vạch ngang
-  if (s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0) {
-    xuLyVachNgang();
-  }
-  // Đi thẳng
-  else if (s1 == 1 && s2 == 1 && s3 == 0 && s4 == 1 && s5 == 1) {
-    diThang(tocDoCoSo);
-  }
-  // Lệch trái nhẹ
-  else if (s1 == 1 && s2 == 0 && s3 == 1 && s4 == 1 && s5 == 1) {
-    reTrai(tocDoRe);
-  }
-  // Lệch phải nhẹ
-  else if (s1 == 1 && s2 == 1 && s3 == 1 && s4 == 0 && s5 == 1) {
-    rePhai(tocDoRe);
-  }
-  // Lệch trái nhiều
-  else if (s1 == 0 && s2 == 1 && s3 == 1 && s4 == 1 && s5 == 1) {
-    reTrai(tocDoRe);
-  }
-  // Lệch phải nhiều
-  else if (s1 == 1 && s2 == 1 && s3 == 1 && s4 == 1 && s5 == 0) {
-    rePhai(tocDoRe);
-  }
-  // Gặp góc cua vuông trái
-  else if (s1 == 0 && s2 == 0 && s3 == 1 && s4 == 1 && s5 == 1) {
-    diThang(tocDoCoSo);
-    delay(150);
-    while(digitalRead(IR3_PIN) == 1) { reTrai(tocDoRe); }
-  }
-  // Gặp góc cua vuông phải
-  else if (s1 == 1 && s2 == 1 && s3 == 1 && s4 == 0 && s5 == 0) {
-    diThang(tocDoCoSo);
-    delay(150);
-    while(digitalRead(IR3_PIN) == 1) { rePhai(tocDoRe); }
-  }
-  // Mất line hoàn toàn
-  else if (s1 == 1 && s2 == 1 && s3 == 1 && s4 == 1 && s5 == 1) {
-    dungLai();
-  }
-}
+  // When inverted sign might be needed depending on robot mapping.
+  // We'll use: left = base + correction, right = base - correction
+  // so positive correction turns robot right.
+  int leftPWM, rightPWM;
 
-// ==========================================================================
-// CÁC HÀM CHỨC NĂNG PHỤ
-// ==========================================================================
+  if (!lost) {
+    float leftF = baseSpeed + correction;
+    float rightF = baseSpeed - correction;
 
-void xuLyVachNgang() {
-  dungLai();
-  delay(200);
+    // map to obey minSpeed and maxSpeed with sign
+    leftPWM = constrain((int)leftF, -maxSpeed, maxSpeed);
+    rightPWM = constrain((int)rightF, -maxSpeed, maxSpeed);
 
-  if (demVachNgang == 0) {
-    Serial.println("Gap vach ngang lan 1 -> Re trai");
-    diThang(tocDoCoSo);
-    delay(200);
-    reTrai(tocDoRe);
-    delay(1000);
-  } 
-  else if (demVachNgang == 1) {
-    Serial.println("Gap vach ngang lan 2 -> Thuc hien gap vat");
-    servoKep.write(70);
-    delay(500);
-    servoXoay.write(90);
-    delay(500);
-    diLui(tocDoCoSo);
-    delay(300);
-    reTrai(tocDoRe);
-    delay(1100);
-    while(digitalRead(IR3_PIN) == 1) {
-        reTrai(tocDoRe);
+    // ensure minimum forward speed if both positive
+    if (leftPWM > 0 && leftPWM < minSpeed) leftPWM = minSpeed;
+    if (rightPWM > 0 && rightPWM < minSpeed) rightPWM = minSpeed;
+
+    // If both sides went negative (rare), clip to small backward speed or stop
+  } else {
+    // LOST: rotate toward last known direction
+    if (lastKnownError > 0.1) {
+      // last seen to the right -> rotate right in place
+      leftPWM = searchSpeed;
+      rightPWM = -searchSpeed;
+    } else if (lastKnownError < -0.1) {
+      // last seen to the left -> rotate left
+      leftPWM = -searchSpeed;
+      rightPWM = searchSpeed;
+    } else {
+      // unknown -> spin slowly right
+      leftPWM = searchSpeed;
+      rightPWM = -searchSpeed;
     }
+    // small timeout handling could be added: if lost for long -> stop
   }
-  
-  demVachNgang++;
-  dungLai();
-  delay(500);
+
+  // Apply motor PWM (handle negative for reverse)
+  setMotorPWM(leftPWM, rightPWM);
+
+  lastError = error;
+  lastTime = now;
+
+  // Debug (comment out if too verbose)
+  Serial.print("s:");
+  Serial.print(v1); Serial.print(v2); Serial.print(v3); Serial.print(v4); Serial.print(v5);
+  Serial.print(" pos:"); Serial.print(position);
+  Serial.print(" err:"); Serial.print(error);
+  Serial.print(" cor:"); Serial.print(correction);
+  Serial.print(" L:"); Serial.print(leftPWM); Serial.print(" R:"); Serial.println(rightPWM);
+
+  delay(15); // small loop delay for stability
 }
 
-// --- CÁC HÀM ĐIỀU KHIỂN ĐỘNG CƠ ---
+// ---------- Motor helper functions ----------
+void setMotorPWM(int leftVal, int rightVal) {
+  // leftVal/rightVal range can be negative (reverse)
+  // left wheel uses IN1 (forward) and IN2 (back)
+  if (leftVal >= 0) {
+    analogWrite(IN1, constrain(leftVal, 0, 255));
+    analogWrite(IN2, 0);
+  } else {
+    analogWrite(IN1, 0);
+    analogWrite(IN2, constrain(-leftVal, 0, 255));
+  }
 
-void diThang(int speed) {
-  analogWrite(MOTOR_L_IN1, speed);
-  analogWrite(MOTOR_L_IN2, 0);
-  analogWrite(MOTOR_R_IN1, 0);
-  analogWrite(MOTOR_R_IN2, speed);
+  // right wheel uses IN3 (forward) and IN4 (back)
+  if (rightVal >= 0) {
+    analogWrite(IN3, constrain(rightVal, 0, 255));
+    analogWrite(IN4, 0);
+  } else {
+    analogWrite(IN3, 0);
+    analogWrite(IN4, constrain(-rightVal, 0, 255));
+  }
 }
 
-void diLui(int speed) {
-  analogWrite(MOTOR_L_IN1, 0);
-  analogWrite(MOTOR_L_IN2, speed);
-  analogWrite(MOTOR_R_IN1, speed);
-  analogWrite(MOTOR_R_IN2, 0);
+void stopMotors() {
+  analogWrite(IN1, 0); analogWrite(IN2, 0);
+  analogWrite(IN3, 0); analogWrite(IN4, 0);
 }
 
-void rePhai(int speed) {
-  analogWrite(MOTOR_L_IN1, speed);
-  analogWrite(MOTOR_L_IN2, 0);
-  analogWrite(MOTOR_R_IN1, speed);
-  analogWrite(MOTOR_R_IN2, 0);
+// ---------- Ultrasonic ----------
+int getDistance(int trigPin, int echoPin) {
+  long duration;
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return 999;
+  return int(duration * 0.034 / 2);
 }
 
-void reTrai(int speed) {
-  analogWrite(MOTOR_L_IN1, 0);
-  analogWrite(MOTOR_L_IN2, speed);
-  analogWrite(MOTOR_R_IN1, 0);
-  analogWrite(MOTOR_R_IN2, speed);
+// ---------- Simple grab sequence ----------
+void grabSequence() {
+  Serial.println("GRAB start");
+  stopMotors();
+  delay(80);
+  // example sequence (tune angles and timing to physical setup)
+  servoRot.write(90);   // xoay vào vị trí lấy
+  delay(300);
+  servoGrip.write(70);  // kẹp
+  delay(350);
+  // nâng lên / lùi nhẹ nếu cần
+  moveLeftWheel(100,0); moveRightWheel(100,0);
+  delay(150);
+  stopMotors();
+  // giữ vật, xoay về vị trí chứa
+  servoRot.write(0);
+  delay(300);
+  // mở nếu muốn thả (servoGrip.write(0))
+  Serial.println("GRAB done");
 }
 
-void dungLai() {
-  analogWrite(MOTOR_L_IN1, 0);
-  analogWrite(MOTOR_L_IN2, 0);
-  analogWrite(MOTOR_R_IN1, 0);
-  analogWrite(MOTOR_R_IN2, 0);
+// Utility small motor helpers (direct)
+void moveLeftWheel(int pwmF, int pwmB) {
+  analogWrite(IN1, pwmF);
+  analogWrite(IN2, pwmB);
+}
+void moveRightWheel(int pwmF, int pwmB) {
+  analogWrite(IN3, pwmF);
+  analogWrite(IN4, pwmB);
 }
