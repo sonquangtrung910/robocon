@@ -1,10 +1,3 @@
-// ROBOT dò line + gắp khi siêu âm <= 10 cm
-// Dựa trên HUSC Shield manual (pin mapping & ví dụ)
-// Servo SE1 (gắp) -> D7, SE2 (xoay) -> D4
-// SR04 TRIG -> A0, ECHO -> A1
-// Motor: IN1=11, IN2=6, IN3=5, IN4=3
-// IR: ir1=8, ir2=10, ir3=2, ir4=12, ir5=13
-
 #include <Servo.h>
 
 #define IN1 11
@@ -12,156 +5,185 @@
 #define IN3 5
 #define IN4 3
 
-#define ir1 8
-#define ir2 10
-#define ir3 2   // chú ý: manual chuyển IR3 sang D2 khi đổi IN1 -> D11
-#define ir4 12
-#define ir5 13
+// Ultrasonic pins
+#define TRIG_PIN A0
+#define ECHO_PIN A1
 
-#define TRIG A0
-#define ECHO A1
+// Servo pins
+#define SERVO_GRIP_PIN 7
+#define SERVO_ROT_PIN 4
 
-#define SERVO_GRIP_PIN 7  // servo1: mở/kẹp
-#define SERVO_ROT_PIN  4  // servo2: xoay
+unsigned long thoigian;
+unsigned long hientai = 0;
+int timecho = 1000; // ms chờ sau khi gắp
 
-Servo servoGrip; // SE1
-Servo servoRot;  // SE2
+// 2 chân enable đã được nối với 5V rồi
+// ta sẽ điều khiển tốc độ động cơ trực tiếp
+// qua 4 chân này
+int toc_do = 200; // biến toc_độ giá trị nằm trong khoảng(0-255)
 
-int speedDefault = 180; // 0-255, chỉnh tuỳ robot
+Servo servoGrip;
+Servo servoRot;
 
-// ---------- Hàm cơ bản điều khiển motor ----------
-void moveForward(int sp) {
-  analogWrite(IN1, sp); analogWrite(IN2, 0);
-  analogWrite(IN3, 0);  analogWrite(IN4, sp);
-}
-void moveBackward(int sp) {
-  analogWrite(IN1, 0);  analogWrite(IN2, sp);
-  analogWrite(IN3, sp);  analogWrite(IN4, 0);
-}
-void stopMotors() {
-  analogWrite(IN1, 0); analogWrite(IN2, 0);
-  analogWrite(IN3, 0); analogWrite(IN4, 0);
-}
-void turnLeft(int sp) {
-  analogWrite(IN1, 0); analogWrite(IN2, sp);
-  analogWrite(IN3, 0); analogWrite(IN4, sp);
-}
-void turnRight(int sp) {
-  analogWrite(IN1, sp); analogWrite(IN2, 0);
-  analogWrite(IN3, sp); analogWrite(IN4, 0);
-}
-
-// ---------- Hàm đọc siêu âm (theo manual) ----------
-int getDistance(int trigPin, int echoPin) {
-  long duration;
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  // thêm timeout 30000us để tránh treo nếu không có phản hồi
-  duration = pulseIn(echoPin, HIGH, 30000);
-  if (duration == 0) return 999; // không nhận tín hiệu -> very far
-  return int(duration * 0.034 / 2); // cm
-}
-
-// ---------- Hàm gắp (sequence) ----------
-void grabSequence() {
-  Serial.println("START GRAB SEQUENCE");
-  stopMotors();
-  delay(100);
-
-  // 1) Đưa servo gắp vào vị trí kẹp (servo1 ~ 70 deg)
-  servoGrip.write(70); // kẹp (manual gợi ý 70-80)
-  delay(500);
-
-  // 2) Xoay tay (servo2) về vị trí lấy vật (90 độ là ví dụ)
-  servoRot.write(90);
-  delay(500);
-
-  // 3) Lùi nhẹ để tách vật/hỗ trợ xoay
-  moveBackward(150);
-  delay(300);
-  stopMotors();
-
-  // (Nếu muốn thả vật sau thao tác, thêm servoGrip.write(0) để mở)
-  Serial.println("GRAB DONE");
-}
-
-// ---------- Setup & Loop ----------
 void setup() {
-  Serial.begin(9600);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
 
-  // Motor pins
-  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  // IR pins
-  pinMode(ir1, INPUT);
-  pinMode(ir2, INPUT);
-  pinMode(ir3, INPUT);
-  pinMode(ir4, INPUT);
-  pinMode(ir5, INPUT);
+  Serial.begin(9600); // Bắt đầu giao tiếp Serial với baudrate 9600
 
-  // Ultrasonic
-  pinMode(TRIG, OUTPUT);
-  pinMode(ECHO, INPUT);
-
-  // Servos
   servoGrip.attach(SERVO_GRIP_PIN);
   servoRot.attach(SERVO_ROT_PIN);
 
-  // Init positions (manual recommends servo1=0 open, servo2=0/180 depending)
-  servoGrip.write(0);   // mở
-  servoRot.write(0);    // vị trí ban đầu
+  // vị trí khởi tạo servo (mở tay, xoay về 0)
+  servoGrip.write(0);  // mở
+  servoRot.write(0);   // vị trí ban đầu
+
+  thoigian = millis();
+}
+
+// ------- Hàm di chuyển (bạn cung cấp) -------
+void moveForward(int speed) { // Hàm tiến
+  analogWrite(IN1, speed); // bên trái quay tiến
+  analogWrite(IN2, 0);
+  analogWrite(IN3, 0); // bên phải quay tiến
+  analogWrite(IN4, speed);
+}
+void turnLeft(int speed) { // hàm quay trái tại chỗ
+  analogWrite(IN1, 0); // bên trái quay lùi
+  analogWrite(IN2, speed);
+  analogWrite(IN3, 0); // bên phải quay tiến
+  analogWrite(IN4, speed);
+}
+void turnLeft1(int speed) { // hàm rẽ trái
+  analogWrite(IN1, 0); // bên trái đứng yên
+  analogWrite(IN2, 0);
+  analogWrite(IN3, 0); // bên phải quay tiến
+  analogWrite(IN4, speed);
+}
+void turnRight(int speed) { // hàm quay phải tại chỗ
+  analogWrite(IN1, speed); // bên trái quay tiến
+  analogWrite(IN2, 0);
+  analogWrite(IN3, speed); // bên phải quay lùi
+  analogWrite(IN4, 0);
+}
+void turnRight1(int speed) { // hàm rẽ phải
+  analogWrite(IN1, speed); // Bên trái quay tiến
+  analogWrite(IN2, 0);
+  analogWrite(IN3, 0); // Bên phải đứng yên
+  analogWrite(IN4, 0);
+}
+void moveBackward(int speed) { // Hàm đi lùi
+  analogWrite(IN1, 0); // bên trái quay lùi
+  analogWrite(IN2, speed);
+  analogWrite(IN3, speed); // bên phải quay lùi
+  analogWrite(IN4, 0);
+}
+void stopMotors() { // Hàm stop
+  analogWrite(IN1, 0); // bên trái đứng yên
+  analogWrite(IN2, 0);
+  analogWrite(IN3, 0); // bên phải đứng yên
+  analogWrite(IN4, 0);
+}
+
+// ---------- Hàm đo siêu âm (1 lần) ----------
+long measureDistanceCmOnce() {
+  // gửi xung 10 microseconds
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // đọc thời gian (timeout 30000 us)
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return -1; // timeout / không nhận
+  // dùng hệ số 0.01715 (duration(us) * 0.01715 = cm)
+  long dist = (long)(duration * 0.01715);
+  return dist;
+}
+
+// ---------- Lấy median của 3 lần đo (ổn định hơn) ----------
+long measureDistanceCm() {
+  const int S = 3;
+  long arr[S];
+  int valid = 0;
+  for (int i = 0; i < S; ++i) {
+    long d = measureDistanceCmOnce();
+    if (d > 0) {
+      arr[valid++] = d;
+    }
+    delay(20);
+  }
+  if (valid == 0) return -1;
+  // sắp xếp nhỏ (valid <=3)
+  for (int i = 1; i < valid; ++i) {
+    long key = arr[i];
+    int j = i - 1;
+    while (j >= 0 && arr[j] > key) {
+      arr[j + 1] = arr[j];
+      j--;
+    }
+    arr[j + 1] = key;
+  }
+  // median
+  return arr[valid / 2];
+}
+
+// ---------- Chuỗi gắp đơn giản ----------
+void grabSequence() {
+  Serial.println("Start grab sequence");
+  stopMotors();
+  delay(80);
+
+  // xoay tay vào vị trí lấy (tùy cơ cấu của bạn)
+  servoRot.write(90);   // xoay ra giữa
+  delay(300);
+
+  // đóng kẹp (gáo kẹp) - chỉnh góc phù hợp servo của bạn
+  servoGrip.write(70);  // kẹp (thay 70 bằng góc phù hợp)
+  delay(400);
+
+  // có thể lùi nhẹ để cố định
+  moveBackward(150);
   delay(200);
+  stopMotors();
+
+  // xoay tay về vị trí chứa (nếu cần)
+  servoRot.write(0);
+  delay(300);
+
+  // nếu muốn mở kẹp để thả, gọi servoGrip.write(0);
+  Serial.println("Grab done");
 }
 
 void loop() {
-  // 1) Đọc khoảng cách trước
-  int dist = getDistance(TRIG, ECHO);
-  Serial.print("Distance: "); Serial.print(dist); Serial.println(" cm");
+  // di chuyển tiến liên tục
+  moveForward(toc_do);
 
-  // Nếu có vật ở gần <= 10cm -> thực hiện gắp
-  if (dist <= 10) {
-    grabSequence();
-    // chờ một chút để tránh gắp lặp lại liên tục
-    delay(1000);
-    return; // quay lại loop
-  }
-
-  // 2) Đọc IR để dò line (logic đơn giản tham khảo manual)
-  int s1 = digitalRead(ir1);
-  int s2 = digitalRead(ir2);
-  int s3 = digitalRead(ir3);
-  int s4 = digitalRead(ir4);
-  int s5 = digitalRead(ir5);
-
-  // manual: 1 = white, 0 = black (line = black)
-  // Nếu line ở giữa -> đi thẳng
-  if (s1 == 1 && s2 == 1 && s3 == 0 && s4 == 1 && s5 == 1) {
-    moveForward(speedDefault);
-  }
-  else if (s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0) {
-    // giao điểm ngang / checkpoint -> dừng & có thể chạy gắp theo ví dụ
-    stopMotors();
-    delay(200);
-    // (tùy nhu cầu: có thể gọi grabSequence() ở đây khi muốn gắp khi gặp checkpoint)
-    moveForward(120);
-    delay(200);
-  }
-  else if ( (s1==1 && s2==1 && s3==1 && s4==0) || (s4==0 && s5==1) ) {
-    // rẽ phải nhẹ
-    turnRight(150);
-  }
-  else if ( (s1==0 && s2==1 && s3==1 && s4==1) || (s1==1 && s2==0) ) {
-    // rẽ trái nhẹ
-    turnLeft(150);
-  }
-  else {
-    // mặc định: đi chậm
-    moveForward(140);
+  // đọc siêu âm không quá thường xuyên
+  if (millis() - thoigian >= 100) { // mỗi 100 ms đo một lần
+    thoigian = millis();
+    long d = measureDistanceCm();
+    if (d < 0) {
+      Serial.println("No echo / out of range");
+    } else {
+      Serial.print("Distance (cm): ");
+      Serial.println(d);
+      // nếu <= 10 cm -> dừng và gắp
+      if (d <= 10) {
+        stopMotors();
+        grabSequence();
+        // tránh lặp lại liên tục: chờ timecho
+        delay(timecho);
+      }
+    }
   }
 
-  delay(50); // loop nhỏ
+  // bạn có thể thêm delay nhỏ hoặc làm việc khác
+  // delay(10); // optional
 }
